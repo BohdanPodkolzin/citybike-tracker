@@ -1,41 +1,22 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+: "${DB_NAME:?}" "${DB_USER:?}" "${DB_PASSWORD:?}" "${DB_PORT:?}" "${ALLOWED_CIDR:?}"
 
-: "${DB_NAME:?DB_NAME is required}"
-: "${DB_USER:?DB_USER is required}"
-: "${DB_PASSWORD:?DB_PASSWORD is required (set it in .env)}"
-: "${DB_PORT:?DB_PORT is required}"
-: "${ALLOWED_CIDR:?ALLOWED_CIDR is required}"
+cd /tmp
 
-echo "==> Installing PostgreSQL"
-apt-get install -y postgresql postgresql-contrib
+apt-get update && apt-get install -y postgresql
 
-PG_VER="$(ls /etc/postgresql | sort -V | tail -n 1)"
-PG_DIR="/etc/postgresql/${PG_VER}/main"
-HBA="${PG_DIR}/pg_hba.conf"
+PG_DIR=$(ls -d /etc/postgresql/*/main)
 
-echo "==> Configuring PostgreSQL ${PG_VER} (port ${DB_PORT})"
-mkdir -p "${PG_DIR}/conf.d"
 cat > "${PG_DIR}/conf.d/citybikes.conf" <<CONF
 listen_addresses = '*'
 port = ${DB_PORT}
-password_encryption = scram-sha-256
 CONF
 
+sed -i '/# citybikes$/d' "${PG_DIR}/pg_hba.conf"
+echo "host ${DB_NAME} ${DB_USER} ${ALLOWED_CIDR} scram-sha-256 # citybikes" >> "${PG_DIR}/pg_hba.conf"
 
-echo "==> Allowing clients: ${ALLOWED_CIDR}"
-# Rebuild our block on every run so re-provisioning never duplicates rules.
-sed -i '/# BEGIN citybikes/,/# END citybikes/d' "${HBA}"
-{
-  echo "# BEGIN citybikes"
-  echo "host    ${DB_NAME}    ${DB_USER}    ${ALLOWED_CIDR}    scram-sha-256"
-  echo "# END citybikes"
-} >> "${HBA}"
-
-
-echo "==> Making the service restart itself if it dies"
 mkdir -p /etc/systemd/system/postgresql@.service.d
 cat > /etc/systemd/system/postgresql@.service.d/restart.conf <<UNIT
 [Unit]
@@ -50,25 +31,14 @@ systemctl daemon-reload
 systemctl enable postgresql
 systemctl restart postgresql
 
-echo "==> Waiting for PostgreSQL"
-for _ in $(seq 1 30); do
-  if sudo -u postgres pg_isready -q -p "${DB_PORT}"; then break; fi
-  sleep 1
-done
-sudo -u postgres pg_isready -p "${DB_PORT}"
+# psql as the postgres user: -t -A = plain output without headers
+psql_() { sudo -u postgres psql -p "${DB_PORT}" -tA "$@"; }
 
-echo "==> Creating role and database"
-# psql variables (:'name') quote values safely, so odd characters in the
-# password cannot break the SQL. \gexec runs the generated statement.
-sudo -u postgres psql -p "${DB_PORT}" -v ON_ERROR_STOP=1 \
-  -v db_user="${DB_USER}" -v db_pass="${DB_PASSWORD}" -v db_name="${DB_NAME}" <<'SQL'
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'db_user', :'db_pass')
-WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'db_user') \gexec
- 
-SELECT format('ALTER ROLE %I PASSWORD %L', :'db_user', :'db_pass') \gexec
- 
-SELECT format('CREATE DATABASE %I OWNER %I', :'db_name', :'db_user')
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db_name') \gexec
-SQL
- 
-echo "==> DB VM ready: ${DB_NAME} on port ${DB_PORT}, clients allowed from ${ALLOWED_CIDR}"
+for _ in $(seq 30); do psql_ -c "select 1" >/dev/null 2>&1 && break; sleep 1; done
+
+# Create the role and the database only if they are missing; always set the password.
+[ "$(psql_ -c "select 1 from pg_roles where rolname='${DB_USER}'")" = 1 ] || psql_ -c "create role ${DB_USER} login"
+psql_ -c "alter role ${DB_USER} password '${DB_PASSWORD}'"
+[ "$(psql_ -c "select 1 from pg_database where datname='${DB_NAME}'")" = 1 ] || psql_ -c "create database ${DB_NAME} owner ${DB_USER}"
+
+echo "db is up on port ${DB_PORT}, open to ${ALLOWED_CIDR}"
