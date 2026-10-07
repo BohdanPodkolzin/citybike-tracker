@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+
 : "${HISTORY_URL:?}"
 
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -

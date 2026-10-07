@@ -17,9 +17,9 @@ def get_env(key, default = nil)
   value.to_s.empty? ? nil : value.to_s
 end
 
-# validation db password
-if (ARGV & %w[up provision reload]).any? && get_env("DB_PASSWORD").nil?
-  abort "DB_PASSWORD is missing. Copy .env.example to .env and set it."
+# validation db password and redis password
+if (ARGV & %w[up provision reload]).any? && (get_env("DB_PASSWORD").nil? || get_env("REDIS_PASSWORD").nil?)
+  abort "DB_PASSWORD or REDIS_PASSWORD is missing. Copy .env.example to .env and set them."
 end
 
 # --- network
@@ -38,7 +38,7 @@ def ip_of(name)
   "#{LAN_PREFIX}.#{HOST_NUMBERS.fetch(name)}"
 end
 
-FETCHER_PORT = get_env("FETCHER_PORT", "8001")
+REDIS_PORT = get_env("REDIS_PORT", "6379")
 HISTORY_PORT = get_env("HISTORY_PORT", "8002")
 
 # where the service code lands inside the VM (provision/*.sh use the same path)
@@ -60,6 +60,8 @@ VMS = [
       "DB_PASSWORD"  => get_env("DB_PASSWORD").to_s,
       "DB_PORT"      => get_env("DB_PORT", "5432").to_s,
       "ALLOWED_CIDR" => get_env("ALLOWED_CIDR", "#{LAN_PREFIX}.0/24").to_s,
+      "REDIS_PORT"     => REDIS_PORT,
+      "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
     },
   },
   {
@@ -70,7 +72,9 @@ VMS = [
     script: "provision/fetcher.sh",
     code: "services/fetcher",
     env: {
-      "PORT"                 => FETCHER_PORT,
+      "REDIS_HOST"           => ip_of("db"),
+      "REDIS_PORT"           => REDIS_PORT,
+      "REDIS_PASSWORD"       => get_env("REDIS_PASSWORD").to_s,
       "CITYBIKES_NETWORK_ID" => get_env("CITYBIKES_NETWORK_ID", "pittsburgh").to_s,
     },
   },
@@ -88,7 +92,9 @@ VMS = [
       "DB_NAME"       => get_env("DB_NAME", "citybikes").to_s,
       "DB_USER"       => get_env("DB_USER", "citybikes_app").to_s,
       "DB_PASSWORD"   => get_env("DB_PASSWORD").to_s,
-      "FETCHER_URL"   => "http://#{ip_of('fetcher')}:#{FETCHER_PORT}",
+      "REDIS_HOST"     => ip_of("db"),
+      "REDIS_PORT"     => REDIS_PORT,
+      "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
       "POLL_INTERVAL" => get_env("POLL_INTERVAL", "60").to_s,
     },
   },

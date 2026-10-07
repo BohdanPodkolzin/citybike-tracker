@@ -13,21 +13,11 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🚲%3C/text%3E%3C/svg%3E"
     />
     <script>
-      // Pick the theme BEFORE React renders, so the page never flashes the
-      // wrong colours. The key must match KEY in src/preferences.js.
-      (function () {
-        var theme = null;
-        try {
-          theme = JSON.parse(localStorage.getItem("cbh:prefs") || "{}").theme;
-        } catch (e) {}
-        if (theme !== "light" && theme !== "dark") {
-          var light =
-            window.matchMedia &&
-            window.matchMedia("(prefers-color-scheme: light)").matches;
-          theme = light ? "light" : "dark";
-        }
-        document.documentElement.dataset.theme = theme;
-      })();
+      // Until the saved settings arrive from the server, follow the system theme.
+      document.documentElement.dataset.theme =
+        window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+          ? "light"
+          : "dark";
     </script>
   </head>
   <body>

@@ -1,10 +1,13 @@
+import json
 import logging
 import threading
+import uuid
 from datetime import datetime, timezone
-
-import requests
-
+ 
+import redis
+ 
 from db import DatabaseUnavailable
+
 
 log = logging.getLogger("history.poller")
 
@@ -14,19 +17,25 @@ class PollError(Exception):
 def _datetime_now():
     return datetime.now(timezone.utc).isoformat()
 
-def get_snapshot(settings):
-    """GET {FETCHER_URL}/snapshot and return the parsed JSON."""
-    url = settings.fetcher_url.rstrip("/") + "/snapshot"
+REQUESTS = "fetch:requests"
+REPLY_PREFIX = "fetch:reply:"
+
+def get_snapshot(cache, settings):
+    """fetcher giving fresh data throug broker(redis) and wait for its answer"""
+    request_id = uuid.uuid4().hex
+    message = json.dumps({"id": request_id})
     try:
-        resp = requests.get(url, timeout=settings.request_timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.Timeout as exc:
-        raise PollError(f"Fetcher timed out: {url}") from exc
-    except ValueError as exc:
-        raise PollError("Fetcher returned invalid JSON") from exc
-    except requests.RequestException as exc:
-        raise PollError(f"Fetcher request failed: {exc}") from exc
+        cache.lpush(REQUESTS, message)
+        item = cache.brpop(REPLY_PREFIX + request_id, timeout=max(1, int(settings.request_timeout)))
+        if item is None:
+            cache.lrem(REQUESTS, 1, message)  # nobody took it: withdraw, so requests never pile up
+            raise PollError("Fetcher did not answer in time (is it running?)")
+        reply = json.loads(item[1])
+    except redis.RedisError as exc:
+        raise PollError(f"Redis: {exc}") from exc
+    if isinstance(reply, dict) and "error" in reply:
+        raise PollError(f"Fetcher: {reply['error']}")
+    return reply
 
 def _parse_time(value):
     if not isinstance(value, str):
@@ -97,11 +106,11 @@ class PollState:
             return dict(self._d)
 
 class Poller:
-    def __init__(self, settings, db, state, fetch=get_snapshot):
+    def __init__(self, settings, db, state, cache=None, fetch=None):
         self._settings = settings
         self._db = db
         self._state = state
-        self._fetch = fetch
+        self._fetch = fetch or (lambda s: get_snapshot(cache, s))
         self._stop = threading.Event()
         self._thread = None
  

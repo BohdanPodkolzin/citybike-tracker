@@ -6,8 +6,8 @@ import {
   useState,
 } from "react";
 import {
+  DEFAULTS,
   loadPreferences,
-  readCached,
   sanitize,
   savePreferences,
 } from "./preferences.js";
@@ -102,17 +102,22 @@ export function useSystemTheme() {
   return theme;
 }
 
-// [prefs, setPref]. Updates the screen immediately, saves in the background.
+// [prefs, setPref, loaded]. Starts with defaults, then loads the saved ones from
+// the server. setPref updates the screen at once and saves in the background.
 export function usePreferences() {
-  const [prefs, setPrefs] = useState(readCached);
+  const [prefs, setPrefs] = useState(DEFAULTS);
+  const [loaded, setLoaded] = useState(false);
   const latest = useRef(prefs);
   latest.current = prefs;
 
   useEffect(() => {
     let alive = true;
-    loadPreferences()
-      .then((p) => alive && setPrefs(sanitize(p)))
-      .catch(() => {});
+    loadPreferences().then((p) => {
+      if (alive) {
+        setPrefs(p);
+        setLoaded(true);
+      }
+    });
     return () => {
       alive = false;
     };
@@ -125,7 +130,7 @@ export function usePreferences() {
     savePreferences(next).catch(() => {});
   }, []);
 
-  return [prefs, setPref];
+  return [prefs, setPref, loaded];
 }
 
 // Width in px of an element, kept up to date on resize (for the SVG charts).

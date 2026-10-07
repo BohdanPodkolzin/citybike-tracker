@@ -11,6 +11,10 @@ import StationsPanel from "./components/StationsPanel.jsx";
 
 const REFRESH_MS = 30_000;
 
+// No answer from History: the browser got nothing (status 0) or nginx on the
+// UI VM could not reach History (502/504).
+const isUnreachable = (e) => e.status === 0 || e.status === 502 || e.status === 504;
+
 function Banner({ tone, children }) {
   return (
     <div className={`banner banner-${tone}`} role="status">
@@ -29,7 +33,7 @@ function Message({ title, children }) {
 }
 
 export default function App() {
-  const [prefs, setPref] = usePreferences();
+  const [prefs, setPref, prefsLoaded] = usePreferences();
   const systemTheme = useSystemTheme();
   const theme = prefs.theme ?? systemTheme;
   const [selectedId, setSelectedId] = useState(null);
@@ -70,7 +74,7 @@ export default function App() {
   if (failure && !fatal) {
     banner = (
       <Banner tone="bad">
-        {failure.status === 0
+        {isUnreachable(failure)
           ? "Can't reach the History service. Retrying automatically, showing the last data."
           : failure.status === 503
             ? "History is running, but its database is unavailable. Retrying automatically."
@@ -85,6 +89,9 @@ export default function App() {
       </Banner>
     );
   }
+
+  // wait a moment for the saved settings, so the page never flashes the wrong theme
+  if (!prefsLoaded) return <AnimatedBackground />;
 
   return (
     <>
@@ -103,7 +110,7 @@ export default function App() {
 
         {fatal ? (
           <Message title="Can't load data">
-            {failure.status === 0
+            {isUnreachable(failure)
               ? "The History service is not reachable. This page keeps retrying every 30 seconds."
               : `${failure.message}. This page keeps retrying every 30 seconds.`}
           </Message>
