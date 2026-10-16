@@ -1,7 +1,10 @@
-"""
-Every operation opens a short-lived connection instead.
-"""
+"""Database layer. All SQL lives here.
 
+Design choice: every operation opens a short-lived connection instead of
+keeping a long-lived one. At one poll per minute that costs nothing, and it
+means a restarted or temporarily unreachable database heals by itself: the
+next operation simply connects again, with no stale connection to repair.
+"""
 import logging
 import threading
 from contextlib import contextmanager

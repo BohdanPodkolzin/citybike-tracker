@@ -1,20 +1,19 @@
-"""History service configuration. Everything comes from environment variables."""
 
 import os
 from dataclasses import dataclass, field
- 
- 
+
+
 class ConfigError(Exception):
     """A required setting is missing or invalid. Fix the environment, not the code."""
- 
- # do not start the app without required vars
+
+
 def _required(env, name):
     value = (env.get(name) or "").strip()
     if not value:
         raise ConfigError(f"Missing required environment variable: {name}")
     return value
- 
- # cast - int | float. minimum - min allowed value
+
+
 def _number(env, name, default, cast, minimum):
     raw = (env.get(name) or "").strip()
     if not raw:
@@ -26,8 +25,8 @@ def _number(env, name, default, cast, minimum):
     if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
     return value
- 
- 
+
+
 # kw_only: fields may be declared in any order (required and optional mixed)
 @dataclass(frozen=True, kw_only=True)
 class Settings:

@@ -17,7 +17,7 @@ def get_env(key, default = nil)
   value.to_s.empty? ? nil : value.to_s
 end
 
-# validation db password and redis password
+# validation db and redis passwords
 if (ARGV & %w[up provision reload]).any? && (get_env("DB_PASSWORD").nil? || get_env("REDIS_PASSWORD").nil?)
   abort "DB_PASSWORD or REDIS_PASSWORD is missing. Copy .env.example to .env and set them."
 end
@@ -38,111 +38,167 @@ def ip_of(name)
   "#{LAN_PREFIX}.#{HOST_NUMBERS.fetch(name)}"
 end
 
-REDIS_PORT = get_env("REDIS_PORT", "6379")
 HISTORY_PORT = get_env("HISTORY_PORT", "8002")
+DB_PORT = get_env("DB_PORT", "5432")
+REDIS_PORT = get_env("REDIS_PORT", "6379")
 
-# where the service code lands inside the VM (provision/*.sh use the same path)
-APP_DIR = "/opt/citybikes/app"
-# not copied to the VMs, they are rebuilt there
+# Dockerfile folder inside the VM
+APP_ROOT = "/opt/citybikes"
+
 SYNC_EXCLUDE = [".venv/", "venv/", "node_modules/", "dist/", "__pycache__/", "test_*.py"].freeze
 
-# --- VMs
+# Flags for the app containers: no Linux capabilities, root filesystem read-only
+# where the app does not need to write (/tmp is a tmpfs).
+HARDEN = "--cap-drop ALL"
+READ_ONLY = "#{HARDEN} --read-only --tmpfs /tmp"
+
+# --- VMs: one VM = one list of containers (each built from its own Dockerfile).
+# To add a service: add an entry here (and a Dockerfile). No copy-pasted VM blocks.
+#   context : folder with the Dockerfile      publish : "host_port:container_port"
+#   volume  : named volume for data           env     : variables the container gets at start
 VMS = [
   {
     name: "db",
     ip: ip_of("db"),
     cpus: 1,
     memory: 1024,
-    script: "provision/db.sh",
-    env: {
-      "DB_NAME"      => get_env("DB_NAME", "citybikes").to_s,
-      "DB_USER"      => get_env("DB_USER", "citybikes_app").to_s,
-      "DB_PASSWORD"  => get_env("DB_PASSWORD").to_s,
-      "DB_PORT"      => get_env("DB_PORT", "5432").to_s,
-      "ALLOWED_CIDR" => get_env("ALLOWED_CIDR", "#{LAN_PREFIX}.0/24").to_s,
-      "REDIS_PORT"     => REDIS_PORT,
-      "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
-    },
+    containers: [
+      {
+        name: "postgres",
+        context: "services/postgres",
+        publish: "#{DB_PORT}:5432",
+        volume: "citybikes-pgdata:/var/lib/postgresql/data",
+        env: {
+          "POSTGRES_DB"       => get_env("DB_NAME", "citybikes").to_s,
+          "POSTGRES_USER"     => get_env("DB_USER", "citybikes_app").to_s,
+          "POSTGRES_PASSWORD" => get_env("DB_PASSWORD").to_s,
+          "ALLOWED_CIDR"      => get_env("ALLOWED_CIDR", "#{LAN_PREFIX}.0/24").to_s,
+        },
+      },
+      {
+        name: "redis",
+        context: "services/redis",
+        publish: "#{REDIS_PORT}:6379",
+        volume: "citybikes-redisdata:/data",
+        env: {
+          "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
+        },
+      },
+    ],
   },
   {
     name: "fetcher",
     ip: ip_of("fetcher"),
     cpus: 1,
     memory: 1024,
-    script: "provision/fetcher.sh",
-    code: "services/fetcher",
-    env: {
-      "REDIS_HOST"           => ip_of("db"),
-      "REDIS_PORT"           => REDIS_PORT,
-      "REDIS_PASSWORD"       => get_env("REDIS_PASSWORD").to_s,
-      "CITYBIKES_NETWORK_ID" => get_env("CITYBIKES_NETWORK_ID", "pittsburgh").to_s,
-    },
+    containers: [
+      {
+        name: "fetcher",
+        context: "services/fetcher",
+        run_args: READ_ONLY,
+        env: {
+          "REDIS_HOST"           => ip_of("db"),
+          "REDIS_PORT"           => REDIS_PORT,
+          "REDIS_PASSWORD"       => get_env("REDIS_PASSWORD").to_s,
+          "CITYBIKES_NETWORK_ID" => get_env("CITYBIKES_NETWORK_ID", "pittsburgh").to_s,
+        },
+      },
+    ],
   },
   {
     name: "history",
     ip: ip_of("history"),
     cpus: 1,
     memory: 1024,
-    script: "provision/history.sh",
-    code: "services/history",
-    env: {
-      "PORT"          => HISTORY_PORT,
-      "DB_HOST"       => ip_of("db"),
-      "DB_PORT"       => get_env("DB_PORT", "5432").to_s,
-      "DB_NAME"       => get_env("DB_NAME", "citybikes").to_s,
-      "DB_USER"       => get_env("DB_USER", "citybikes_app").to_s,
-      "DB_PASSWORD"   => get_env("DB_PASSWORD").to_s,
-      "REDIS_HOST"     => ip_of("db"),
-      "REDIS_PORT"     => REDIS_PORT,
-      "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
-      "POLL_INTERVAL" => get_env("POLL_INTERVAL", "60").to_s,
-    },
+    containers: [
+      {
+        name: "history",
+        context: "services/history",
+        publish: "#{HISTORY_PORT}:8002",
+        run_args: READ_ONLY,
+        env: {
+          "DB_HOST"        => ip_of("db"),
+          "DB_PORT"        => DB_PORT,
+          "DB_NAME"        => get_env("DB_NAME", "citybikes").to_s,
+          "DB_USER"        => get_env("DB_USER", "citybikes_app").to_s,
+          "DB_PASSWORD"    => get_env("DB_PASSWORD").to_s,
+          "REDIS_HOST"     => ip_of("db"),
+          "REDIS_PORT"     => REDIS_PORT,
+          "REDIS_PASSWORD" => get_env("REDIS_PASSWORD").to_s,
+          "POLL_INTERVAL"  => get_env("POLL_INTERVAL", "60").to_s,
+        },
+      },
+    ],
   },
   {
     name: "ui",
     ip: ip_of("ui"),
     cpus: 1,
     memory: 1024,
-    script: "provision/ui.sh",
-    code: "services/ui",
     message: "==> citybikes-ui is up. Open http://#{ip_of('ui')} (from any device in your LAN)",
-    env: {
-      "HISTORY_URL" => "http://#{ip_of('history')}:#{HISTORY_PORT}",
-    },
+    containers: [
+      {
+        name: "ui",
+        context: "services/ui",
+        publish: "80:8080",
+        run_args: HARDEN,
+        env: {
+          "HISTORY_URL" => "http://#{ip_of('history')}:#{HISTORY_PORT}",
+        },
+      },
+    ],
   },
 ].freeze
 
+# the variables run-container.sh needs for one container
+def container_env(c)
+  c[:env].merge(
+    "CONTAINER_NAME" => c[:name],
+    "BUILD_DIR"      => "#{APP_ROOT}/#{c[:name]}",
+    "ENV_KEYS"       => c[:env].keys.join(" "),
+    "PUBLISH"        => c[:publish].to_s,
+    "VOLUME"         => c[:volume].to_s,
+    "RUN_ARGS"       => c[:run_args].to_s,
+  )
+end
+
 # --- build
 Vagrant.configure("2") do |config|
-    config.vm.box = BOX
-    config.vm.box_check_update = false
+  config.vm.box = BOX
+  config.vm.box_check_update = false
 
-    # DO NOT synchronize the actual dir with the VMs vagrant dir
-    config.vm.synced_folder ".", "/vagrant", disabled: true
+  # DO NOT synchronize the actual dir with the VMs vagrant dir
+  config.vm.synced_folder ".", "/vagrant", disabled: true
 
-    VMS.each do |vm|
-        config.vm.define vm[:name] do |node|
-            node.vm.hostname = "citybikes-#{vm[:name]}"
+  VMS.each do |vm|
+    config.vm.define vm[:name] do |node|
+      node.vm.hostname = "citybikes-#{vm[:name]}"
 
-            # briged
-            net_opts = { ip: vm[:ip], netmask: NETMASK }
-            net_opts[:bridge] = BRIDGE if BRIDGE
-            node.vm.network "public_network", **net_opts
+      # bridged: a real address in your LAN
+      net_opts = { ip: vm[:ip], netmask: NETMASK }
+      net_opts[:bridge] = BRIDGE if BRIDGE
+      node.vm.network "public_network", **net_opts
 
-            node.vm.provider "virtualbox" do |vb|
-                vb.name   = "citybikes-#{vm[:name]}"
-                vb.cpus   = vm[:cpus]
-                vb.memory = vm[:memory]
-            end
+      node.vm.provider "virtualbox" do |vb|
+        vb.name   = "citybikes-#{vm[:name]}"
+        vb.cpus   = vm[:cpus]
+        vb.memory = vm[:memory]
+      end
 
-            # copy the service code into the VM (only for VMs that have code)
-            if vm[:code]
-                node.vm.synced_folder vm[:code], APP_DIR, type: "rsync", rsync__exclude: SYNC_EXCLUDE
-            end
+      # code + Dockerfile copying to VM
+      vm[:containers].each do |c|
+        node.vm.synced_folder c[:context], "#{APP_ROOT}/#{c[:name]}", type: "rsync", rsync__exclude: SYNC_EXCLUDE
+      end
 
-            node.vm.provision "service", type: "shell", path: vm[:script], env: vm[:env]
+      # 2. enabling docker
+      node.vm.provision "docker", type: "shell", path: "provision/docker.sh"
 
-            node.vm.post_up_message = vm[:message] || "==> citybikes-#{vm[:name]} is at #{vm[:ip]}"
-        end
+      # build image + start its container 
+      vm[:containers].each do |c|
+        node.vm.provision "app-#{c[:name]}", type: "shell", path: "provision/run-container.sh", env: container_env(c)
+      end
+
+      node.vm.post_up_message = vm[:message] || "==> citybikes-#{vm[:name]} is at #{vm[:ip]}"
     end
+  end
 end

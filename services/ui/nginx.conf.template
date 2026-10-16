@@ -1,0 +1,41 @@
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+
+    # The browser talks to ONE origin; /api goes to the History service.
+    location /api/ {
+        proxy_pass ${HISTORY_URL};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+
+    # History is down: the same JSON error the UI already understands.
+    error_page 502 503 504 = @history_down;
+    location @history_down {
+        default_type application/json;
+        return 502 '{"error": "history service unreachable"}';
+    }
+
+    # Vite file names contain a content hash: cache them for a year.
+    location /assets/ {
+        expires 1y;
+        try_files $uri =404;
+    }
+
+    location / {
+        expires -1;   # index.html must always be fresh, it points at the hashed assets
+        try_files $uri /index.html;
+    }
+}
