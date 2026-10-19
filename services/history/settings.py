@@ -1,4 +1,3 @@
-
 import os
 from dataclasses import dataclass, field
 
@@ -27,6 +26,23 @@ def _number(env, name, default, cast, minimum):
     return value
 
 
+QUEUE_BACKENDS = ("rabbitmq", "postgres")
+CACHE_BACKENDS = ("redis", "postgres")
+
+
+def _choice(env, name, allowed, default):
+    raw = (env.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in allowed:
+        raise ConfigError(f"{name} must be one of {', '.join(allowed)}, got {raw!r}")
+    return raw
+
+
+def _optional(env, name):
+    return (env.get(name) or "").strip()
+
+
 # kw_only: fields may be declared in any order (required and optional mixed)
 @dataclass(frozen=True, kw_only=True)
 class Settings:
@@ -34,10 +50,17 @@ class Settings:
     db_name: str
     db_user: str
     db_password: str = field(repr=False)  # never printed in logs or tracebacks
-    redis_host: str
-    redis_password: str = field(repr=False)
-    db_port: int = 5432
+    queue_backend: str = "rabbitmq"
+    cache_backend: str = "redis"
+    redis_host: str = ""
+    redis_password: str = field(default="", repr=False)
     redis_port: int = 6379
+    rabbitmq_host: str = ""
+    rabbitmq_user: str = ""
+    rabbitmq_password: str = field(default="", repr=False)
+    rabbitmq_port: int = 5672
+    rabbitmq_vhost: str = "citybikes"
+    db_port: int = 5432
     poll_interval: float = 60.0
     request_timeout: float = 10.0
     db_connect_timeout: int = 5
@@ -47,13 +70,25 @@ class Settings:
     @classmethod
     def from_env(cls, env=None):
         env = os.environ if env is None else env
+        queue = _choice(env, "QUEUE_BACKEND", QUEUE_BACKENDS, "rabbitmq")
+        cache = _choice(env, "CACHE_BACKEND", CACHE_BACKENDS, "redis")
+        # a backend's own settings are required only when that backend is chosen
+        pick = _required if queue == "rabbitmq" else _optional
+        pick_redis = _required if cache == "redis" else _optional
         return cls(
+            queue_backend=queue,
+            cache_backend=cache,
+            rabbitmq_host=pick(env, "RABBITMQ_HOST"),
+            rabbitmq_user=pick(env, "RABBITMQ_USER"),
+            rabbitmq_password=pick(env, "RABBITMQ_PASSWORD"),
+            rabbitmq_port=_number(env, "RABBITMQ_PORT", 5672, int, 1),
+            rabbitmq_vhost=_optional(env, "RABBITMQ_VHOST") or "citybikes",
+            redis_host=pick_redis(env, "REDIS_HOST"),
+            redis_password=pick_redis(env, "REDIS_PASSWORD"),
             db_host=_required(env, "DB_HOST"),
             db_name=_required(env, "DB_NAME"),
             db_user=_required(env, "DB_USER"),
             db_password=_required(env, "DB_PASSWORD"),
-            redis_host=_required(env, "REDIS_HOST"),
-            redis_password=_required(env, "REDIS_PASSWORD"),
             db_port=_number(env, "DB_PORT", 5432, int, 1),
             redis_port=_number(env, "REDIS_PORT", 6379, int, 1),
             poll_interval=_number(env, "POLL_INTERVAL", 60.0, float, 5),

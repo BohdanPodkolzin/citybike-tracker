@@ -1,0 +1,71 @@
+// What this agent does, in four steps:
+//   1. find the Docker containers on this VM
+//   2. read their stdout/stderr, add labels (host, container, level)
+//   3. read the systemd journal (sshd logins, docker daemon, kernel), add labels (host, unit, level)
+//   4. push everything to Loki on the db VM
+
+logging {
+  level  = "warn"
+  format = "logfmt"
+}
+
+// ---- 1-2. Docker containers
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // "/history" -> container="history"
+    rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = { source = "docker", host = sys.env("VM_NAME") }
+  forward_to = [loki.process.containers.receiver]
+}
+
+loki.process "containers" {
+  stage.regex {
+    expression = "^\\S+ \\S+ (?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL) "
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  forward_to = [loki.write.central.receiver]
+}
+
+// ---- 3. systemd journal
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "journal" {
+  max_age       = "12h"
+  labels        = { source = "journal", host = sys.env("VM_NAME") }
+  relabel_rules = loki.relabel.journal.rules
+  forward_to    = [loki.write.central.receiver]
+}
+
+// ---- 4. Loki on the db VM
+loki.write "central" {
+  endpoint {
+    url = sys.env("LOKI_PUSH_URL")
+  }
+}

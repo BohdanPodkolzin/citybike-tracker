@@ -1,36 +1,8 @@
-# --- Secrets (never commit) ---
 .env
-*.env
-!.env.example
-
-# --- Vagrant ---
+*.log
 .vagrant/
-*.box
-
-# --- Python (fetcher, history) ---
-.venv/
-venv/
 __pycache__/
-*.pyc
-.pytest_cache/
-
-# --- Node / Vite (ui) ---
 node_modules/
 dist/
-.vite/
-*.local
-
-# --- Logs and test output ---
-*.log
-npm-debug.log*
-coverage/
-
-# --- draw.io backups ---
-*.drawio.bkp
-.$*.drawio.bkp
-
-# --- Editors and OS ---
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+ssh_config
+.ssh_known_hosts

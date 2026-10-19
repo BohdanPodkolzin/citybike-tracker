@@ -1,19 +1,14 @@
-"""History service: polls Fetcher on a timer, stores snapshots in PostgreSQL
-and serves them to the UI over a small REST API.
-
-Run ONE process (gunicorn: --workers 1 --threads 4). The poller lives inside
-the process, so several workers would each poll and store duplicates.
-"""
 import json
 import logging
 import re
 import uuid
 
-import redis
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import BadRequest, HTTPException
 
+from broker import make_requester
 from db import Database, DatabaseUnavailable
+from kvstore import CacheUnavailable, make_store
 from poller import Poller, PollState
 from settings import ConfigError, Settings
 
@@ -50,7 +45,7 @@ def _delta(cur, prev):
     }
 
 
-# ---- user preferences: kept in Redis under an id from a cookie (no login) ----
+# ---- user preferences: kept in the cache (Redis or PostgreSQL) under an id from a cookie (no login) ----
 SESSION_COOKIE = "sid"
 SESSION_RE = re.compile(r"^[0-9a-f]{32}$")  # only ids we generated ourselves are accepted
 PREFS_TTL = 30 * 24 * 3600                   # 30 days, renewed on every save
@@ -65,17 +60,13 @@ def clean_prefs(data):
             for key, allowed in PREF_CHOICES.items()}
 
 
-def make_cache(s):
-    return redis.Redis(host=s.redis_host, port=s.redis_port, password=s.redis_password,
-                       decode_responses=True, socket_connect_timeout=3,
-                       socket_timeout=s.request_timeout + 5)  # longer than the wait for a fetcher reply
-
-
-def create_app(settings=None, db=None, cache=None, start_poller=True):
+def create_app(settings=None, db=None, cache=None, start_poller=True, requester=None):
     settings = settings or Settings.from_env()
     db = db or Database(settings)
-    cache = cache if cache is not None else make_cache(settings)
+    cache = cache if cache is not None else make_store(settings, db)
+    requester = requester if requester is not None else make_requester(settings, db)
     state = PollState()
+    log.info("queue backend: %s, cache backend: %s", settings.queue_backend, settings.cache_backend)
 
     app = Flask(__name__)
 
@@ -85,7 +76,7 @@ def create_app(settings=None, db=None, cache=None, start_poller=True):
         log.warning("database unavailable: %s", exc)
         return jsonify({"error": "database unavailable"}), 503
 
-    @app.errorhandler(redis.RedisError)
+    @app.errorhandler(CacheUnavailable)
     def cache_down(exc):
         log.warning("cache unavailable: %s", exc)
         return jsonify({"error": "cache unavailable"}), 503
@@ -109,6 +100,8 @@ def create_app(settings=None, db=None, cache=None, start_poller=True):
     def status():
         info = state.snapshot()
         info["poll_interval"] = settings.poll_interval
+        info["queue_backend"] = settings.queue_backend
+        info["cache_backend"] = settings.cache_backend
         try:
             info["snapshots_total"] = db.count_snapshots()
             info["db_ok"] = True
@@ -159,14 +152,14 @@ def create_app(settings=None, db=None, cache=None, start_poller=True):
         sid = request.cookies.get(SESSION_COOKIE, "")
         if not SESSION_RE.match(sid):
             sid = uuid.uuid4().hex  # first save from this browser: give it an id
-        cache.set(f"prefs:{sid}", json.dumps(prefs), ex=PREFS_TTL)
+        cache.set(f"prefs:{sid}", json.dumps(prefs), PREFS_TTL)
         resp = jsonify(prefs)
         resp.set_cookie(SESSION_COOKIE, sid, max_age=PREFS_TTL, httponly=True, samesite="Lax")
         return resp
 
     # ----------------------------------------------------------- poller ----
     if start_poller:
-        poller = Poller(settings, db, state, cache)
+        poller = Poller(settings, db, state, requester)
         poller.start()
         app.extensions["poller"] = poller
 

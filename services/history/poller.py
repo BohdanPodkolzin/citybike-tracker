@@ -1,14 +1,8 @@
-"""Background poller: every POLL_INTERVAL seconds ask Fetcher for a snapshot
-and store it. A failed cycle is logged and the loop carries on, so a down
-Fetcher or database never kills the service."""
-import json
 import logging
 import threading
-import uuid
 from datetime import datetime, timezone
 
-import redis
-
+from broker import BrokerError, QueueTimeout
 from db import DatabaseUnavailable
 
 log = logging.getLogger("history.poller")
@@ -21,32 +15,17 @@ class PollError(Exception):
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-
-REQUESTS = "fetch:requests"
-REPLY_PREFIX = "fetch:reply:"
-
-
-def fetch_snapshot(cache, settings):
-    """Ask the fetcher for fresh data through Redis and wait for its answer.
-
-    Request/reply over queues: we push {"id": ...} to "fetch:requests" and wait
-    on our own reply list "fetch:reply:<id>", which only the fetcher writes to.
-    """
-    request_id = uuid.uuid4().hex
-    message = json.dumps({"id": request_id})
+def fetch_snapshot(requester, settings):
+    """Ask the fetcher for fresh data through the queue backend and wait for its answer."""
     try:
-        cache.lpush(REQUESTS, message)
-        item = cache.brpop(REPLY_PREFIX + request_id, timeout=max(1, int(settings.request_timeout)))
-        if item is None:
-            cache.lrem(REQUESTS, 1, message)  # nobody took it: withdraw, so requests never pile up
-            raise PollError("Fetcher did not answer in time (is it running?)")
-        reply = json.loads(item[1])
-    except redis.RedisError as exc:
-        raise PollError(f"Redis: {exc}") from exc
+        reply = requester.request(settings.request_timeout)
+    except QueueTimeout as exc:
+        raise PollError("Fetcher did not answer in time (is it running?)") from exc
+    except BrokerError as exc:
+        raise PollError(f"{requester.name}: {exc}") from exc
     if isinstance(reply, dict) and "error" in reply:
         raise PollError(f"Fetcher: {reply['error']}")
     return reply
-
 
 def _parse_time(value):
     if not isinstance(value, str):
@@ -57,13 +36,7 @@ def _parse_time(value):
         raise PollError(f"Bad fetched_at: {value!r}") from exc
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-
 def build_snapshot(data):
-    """Validate the Fetcher payload; return (aggregates, stations).
-
-    Unknown counters (None) are left out of the sums instead of being
-    counted as zero, so missing data cannot fake an empty network.
-    """
     if not isinstance(data, dict) or not isinstance(data.get("stations"), list):
         raise PollError("Unexpected Fetcher response format")
 
@@ -87,7 +60,6 @@ def build_snapshot(data):
         "occupancy_pct": round(100.0 * bikes / total, 1) if total > 0 else None,
     }
     return agg, stations
-
 
 class PollState:
     """Thread-safe status of the poller, shown by /api/status."""
@@ -124,11 +96,11 @@ class PollState:
 
 
 class Poller:
-    def __init__(self, settings, db, state, cache=None, fetch=None):
+    def __init__(self, settings, db, state, requester=None, fetch=None):
         self._settings = settings
         self._db = db
         self._state = state
-        self._fetch = fetch or (lambda s: fetch_snapshot(cache, s))
+        self._fetch = fetch or (lambda s: fetch_snapshot(requester, s))
         self._stop = threading.Event()
         self._thread = None
 
@@ -169,3 +141,4 @@ class Poller:
 
     def stop(self):
         self._stop.set()
+        
