@@ -21,7 +21,7 @@ class QueueTimeout(BrokerError):
     """Nobody answered in time."""
 
 
-# ============================================================== RabbitMQ
+# ============================================================== RabbitMQ ====
 class RabbitRequester:
     name = "rabbitmq"
 
@@ -44,9 +44,11 @@ class RabbitRequester:
         got = {}
 
         def on_reply(_channel, _method, props, body):
-            if props.correlation_id == correlation_id:
+            if props.correlation_id == correlation_id:  # only the answer to OUR request
                 got["body"] = body
 
+        # a short-lived connection per request (one poll a minute): a restarted broker
+        # heals by itself, there is no stale connection to repair
         try:
             conn = pika.BlockingConnection(self._params())
         except errors as exc:
@@ -83,11 +85,10 @@ class RabbitRequester:
 
 
 # ============================================================= PostgreSQL ====
-
 REQUESTS = "fetch_requests"
 REPLIES = "fetch_replies"
-STALE_AFTER = 60       
-REPLY_VT = 30         
+STALE_AFTER = 60       # seconds: a message older than this was abandoned by its sender
+REPLY_VT = 30          # visibility timeout (s) of a reply while History holds it; it is deleted right after
 
 SCHEMA = f"""
 SELECT pg_advisory_xact_lock(727401);  -- History and Fetcher may both set up at start
@@ -95,7 +96,8 @@ CREATE EXTENSION IF NOT EXISTS pgmq;
 SELECT pgmq.create('{REQUESTS}');
 SELECT pgmq.create('{REPLIES}')
 """
-
+# Nobody ever consumes the answer to a request that History gave up on (and the other way round after a
+# crash), so abandoned messages are removed here. pgmq keeps them in the ordinary tables pgmq.q_<queue>.
 CLEANUP = (f"DELETE FROM pgmq.q_{REQUESTS} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'; "
            f"DELETE FROM pgmq.q_{REPLIES} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'")
 SEND = f"SELECT pgmq.send('{REQUESTS}', %s::jsonb)"
@@ -122,22 +124,25 @@ class PostgresRequester:
         mine = json.dumps({"id": correlation_id})
         try:
             with self._db.connection() as conn:
-                conn.autocommit = True  
                 self._ensure_schema(conn)
                 with conn.cursor() as cur:
                     cur.execute(CLEANUP)
                     cur.execute(SEND, (mine,))
                     request_msg_id = cur.fetchone()[0]
-
+                conn.commit()  # from here on the Fetcher can see (and take) the request
+                with conn.cursor() as cur:
                     cur.execute(WAIT_REPLY, (max(1, math.ceil(timeout)), mine))
                     row = cur.fetchone()
                     if row is None:
-                        cur.execute(WITHDRAW, (request_msg_id,))  
-                        raise QueueTimeout("no answer in time")
-                    reply_msg_id, body = row
-                    cur.execute(DELETE_REPLY, (reply_msg_id,))
+                        cur.execute(WITHDRAW, (request_msg_id,))  # nobody took it: withdraw it
+                    else:
+                        cur.execute(DELETE_REPLY, (row[0],))
+                conn.commit()  # before raising below: an exception inside "with conn" rolls back
         except DatabaseUnavailable as exc:
             raise BrokerError(str(exc)) from exc
+        if row is None:
+            raise QueueTimeout("no answer in time")
+        body = row[1]
         try:
             reply = json.loads(body)["reply"]
         except (ValueError, KeyError, TypeError) as exc:
@@ -147,7 +152,7 @@ class PostgresRequester:
         return reply
 
 
-# ================================================================ factory
+# ================================================================ factory ====
 def make_requester(settings, db):
     if settings.queue_backend == "rabbitmq":
         return RabbitRequester(settings)
