@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Switch the queue and/or the cache backend WITHOUT rebuilding anything.
-# The flags are plain environment variables of the containers; this script changes them in
-# .env and recreates only the affected containers (the images are reused: the code did not change).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

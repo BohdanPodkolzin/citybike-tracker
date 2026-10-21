@@ -115,6 +115,23 @@ def cache_env
   }
 end
 
+CLOUDFLARE_TUNNEL_TOKEN = get_env("CLOUDFLARE_TUNNEL_TOKEN")
+def cloudflared_containers
+  return [] if CLOUDFLARE_TUNNEL_TOKEN.nil?
+  [
+    {
+      name: "cloudflared",
+      context: "services/cloudflared",
+      run_args: READ_ONLY,
+      env: {
+        "TUNNEL_TOKEN" => CLOUDFLARE_TUNNEL_TOKEN,
+        # auto = QUIC (UDP 7844) with fallback; set http2 (TCP 443) if your network blocks UDP
+        "TUNNEL_TRANSPORT_PROTOCOL" => get_env("CLOUDFLARE_TUNNEL_PROTOCOL", "auto").to_s,
+      },
+    },
+  ]
+end
+
 VMS = [
   {
     name: "db",
@@ -235,7 +252,7 @@ VMS = [
           "HISTORY_URL" => "http://#{ip_of('history')}:#{HISTORY_PORT}",
         },
       },
-    ],
+    ] + cloudflared_containers,
   },
   {
     # The only way in: ssh bastion, then from it to every other VM (see README). No containers.
