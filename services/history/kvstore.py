@@ -5,6 +5,7 @@ from db import DatabaseUnavailable
 
 log = logging.getLogger("history.kvstore")
 
+
 class CacheUnavailable(Exception):
     """The cache backend is unreachable right now (a transient problem)."""
 
@@ -17,7 +18,7 @@ class RedisStore:
         self._client = None
 
     def _redis(self):
-        if self._client is None:
+        if self._client is None:  # created on first use, so the module is not needed until then
             import redis
             s = self._s
             self._client = redis.Redis(
@@ -42,17 +43,30 @@ class RedisStore:
 
 KV_SCHEMA = """
 SELECT pg_advisory_xact_lock(727402);
-CREATE TABLE IF NOT EXISTS kv_store (
-    key        TEXT        PRIMARY KEY,
-    value      TEXT        NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_kv_store_expires_at ON kv_store (expires_at);
+CREATE EXTENSION IF NOT EXISTS hstore;
+CREATE TABLE IF NOT EXISTS kv_hstore (
+    namespace TEXT   PRIMARY KEY,
+    entries   hstore NOT NULL DEFAULT ''::hstore,
+    expires   hstore NOT NULL DEFAULT ''::hstore
+)
 """
-KV_GET = "SELECT value FROM kv_store WHERE key = %s AND expires_at > now()"
-KV_SET = ("INSERT INTO kv_store (key, value, expires_at) VALUES (%s, %s, now() + make_interval(secs => %s)) "
-          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at")
-KV_PURGE = "DELETE FROM kv_store WHERE expires_at < now()"
+
+KV_GET = ("SELECT entries -> %s FROM kv_hstore "
+          "WHERE namespace = %s AND (expires -> %s)::bigint > extract(epoch FROM now())::bigint")
+
+_EXPIRED = ("ARRAY(SELECT k FROM each(kv_hstore.expires) AS e(k, v) "
+            "WHERE v::bigint <= extract(epoch FROM now())::bigint)")
+KV_SET = ("INSERT INTO kv_hstore (namespace, entries, expires) "
+          "VALUES (%s, hstore(%s::text, %s::text), hstore(%s::text, (extract(epoch FROM now())::bigint + %s)::text)) "
+          "ON CONFLICT (namespace) DO UPDATE SET "
+          f"entries = delete(kv_hstore.entries, {_EXPIRED}) || EXCLUDED.entries, "
+          f"expires = delete(kv_hstore.expires, {_EXPIRED}) || EXCLUDED.expires")
+
+
+def _namespace(key):
+    """"prefs:ab12..." -> "prefs" (keys without a colon share the namespace "default")."""
+    head, sep, _ = key.partition(":")
+    return head if sep and head else "default"
 
 
 class PostgresStore:
@@ -77,7 +91,7 @@ class PostgresStore:
             with self._db.connection() as conn:
                 self._ensure_schema(conn)
                 with conn.cursor() as cur:
-                    cur.execute(KV_GET, (key,))
+                    cur.execute(KV_GET, (key, _namespace(key), key))
                     row = cur.fetchone()
             return row[0] if row else None
         except DatabaseUnavailable as exc:
@@ -88,8 +102,7 @@ class PostgresStore:
             with self._db.connection() as conn:
                 self._ensure_schema(conn)
                 with conn.cursor() as cur:
-                    cur.execute(KV_PURGE)  # saving is rare, so cleaning up here is enough
-                    cur.execute(KV_SET, (key, value, ttl))
+                    cur.execute(KV_SET, (_namespace(key), key, value, key, int(ttl)))
         except DatabaseUnavailable as exc:
             raise CacheUnavailable(str(exc)) from exc
 

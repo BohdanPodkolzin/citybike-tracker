@@ -1,10 +1,3 @@
-"""Database layer. All SQL lives here.
-
-Design choice: every operation opens a short-lived connection instead of
-keeping a long-lived one. At one poll per minute that costs nothing, and it
-means a restarted or temporarily unreachable database heals by itself: the
-next operation simply connects again, with no stale connection to repair.
-"""
 import logging
 import threading
 from contextlib import contextmanager
@@ -91,6 +84,10 @@ class Database:
             raise DatabaseUnavailable(str(exc).strip()) from exc
         finally:
             conn.close()
+
+    def connection(self):
+        """A short-lived connection for other modules (the PostgreSQL queue and cache)."""
+        return self._connection()
 
     def ensure_schema(self):
         """Create tables if missing. Cheap after the first success."""

@@ -6,11 +6,13 @@ import time
 log = logging.getLogger("fetcher.broker")
 
 REQUEST_QUEUE = "fetch.requests"
-REPLY_TTL = 60          # seconds a reply stays in Postgres if History gave up waiting
-LEASE = 30              # seconds a Postgres request is "ours" before it is offered again
-POLL = 0.5              # seconds between looks at an empty Postgres queue
+LEASE = 30              # pgmq visibility timeout (s): a request is "ours" this long, then it is offered again
+WAIT = 5                # seconds one pgmq.read_with_poll() waits inside PostgreSQL for a request
+POLL_MS = 200           # how often read_with_poll() looks, in milliseconds
+STALE_AFTER = 60        # seconds: a request older than this was abandoned by History
+MAX_READS = 3           # a request that was handed out more often than this keeps killing its worker: drop it
 RETRY = 3               # seconds to wait before reconnecting
-
+          
 BACKENDS = ("rabbitmq", "postgres")
 
 class ConfigError(Exception):
@@ -94,45 +96,23 @@ class RabbitConsumer:
 
 
 # ============================================================= PostgreSQL
-SCHEMA = """
-SELECT pg_advisory_xact_lock(727401);  -- History and Fetcher may both create the tables at start
-CREATE TABLE IF NOT EXISTS mq_requests (
-    id             BIGSERIAL   PRIMARY KEY,
-    queue          TEXT        NOT NULL,
-    correlation_id TEXT        NOT NULL,
-    body           TEXT        NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL,
-    locked_until   TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_mq_requests_queue ON mq_requests (queue, id);
-CREATE TABLE IF NOT EXISTS mq_replies (
-    correlation_id TEXT        PRIMARY KEY,
-    body           TEXT        NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL
-);
+REQUESTS = "fetch_requests"
+REPLIES = "fetch_replies"
+
+SCHEMA = f"""
+SELECT pg_advisory_xact_lock(727401);  -- History and Fetcher may both set up at start
+CREATE EXTENSION IF NOT EXISTS pgmq;
+SELECT pgmq.create('{REQUESTS}');
+SELECT pgmq.create('{REPLIES}')
 """
 
 # take ONE request that is not expired and not leased by another worker (SKIP LOCKED: never wait)
-CLAIM = """
-UPDATE mq_requests SET locked_until = now() + make_interval(secs => %s)
-WHERE id = (
-    SELECT id FROM mq_requests
-    WHERE queue = %s AND expires_at > now() AND (locked_until IS NULL OR locked_until < now())
-    ORDER BY id
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-RETURNING id, correlation_id, body
-"""
-REPLY = """
-INSERT INTO mq_replies (correlation_id, body, expires_at)
-VALUES (%s, %s, now() + make_interval(secs => %s))
-ON CONFLICT (correlation_id) DO UPDATE SET body = EXCLUDED.body, expires_at = EXCLUDED.expires_at
-"""
-DONE = "DELETE FROM mq_requests WHERE id = %s"
-CLEANUP = ("DELETE FROM mq_requests WHERE expires_at < now() - interval '1 minute'; "
-           "DELETE FROM mq_replies WHERE expires_at < now()")
-
+CLAIM = (f"SELECT msg_id, read_ct, message::text, (now() - enqueued_at) > make_interval(secs => %s) "
+         f"FROM pgmq.read_with_poll('{REQUESTS}', %s, 1, %s, %s)")
+REPLY = f"SELECT pgmq.send('{REPLIES}', %s::jsonb)"
+DONE = f"SELECT pgmq.delete('{REQUESTS}', %s::bigint)"
+CLEANUP = (f"DELETE FROM pgmq.q_{REQUESTS} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'; "
+           f"DELETE FROM pgmq.q_{REPLIES} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'")
 
 class PostgresConsumer:
     name = "postgres"
@@ -167,18 +147,18 @@ class PostgresConsumer:
             try:
                 conn = self._connect()
                 self.ensure_schema(conn)
-                log.info("worker ready, waiting for requests in table mq_requests")
+                log.info("worker ready, waiting for requests in the pgmq queue %s", REQUESTS)
                 idle = 0
                 while True:
+
                     if self.process_one(conn, handle):
                         idle = 0
                         continue
                     idle += 1
-                    if idle % 120 == 1:  # about once a minute while idle
+                    if idle % 12 == 1:  
                         with conn, conn.cursor() as cur:
                             cur.execute(CLEANUP)
-                    time.sleep(POLL)
-            except psycopg2.Error as exc:  # database restarting or unreachable
+            except psycopg2.Error as exc: 
                 log.warning("postgres problem: %s", exc)
                 time.sleep(RETRY)
             finally:
@@ -189,18 +169,28 @@ class PostgresConsumer:
                         pass
 
     def process_one(self, conn, handle):
-        """Claim one request, answer it. Returns False when the queue is empty."""
-        with conn, conn.cursor() as cur:
-            cur.execute(CLAIM, (LEASE, REQUEST_QUEUE))
+        """Take one request, answer it. Returns False when the queue stayed empty."""
+        with conn, conn.cursor() as cur: 
+            cur.execute(CLAIM, (STALE_AFTER, LEASE, WAIT, POLL_MS))
             row = cur.fetchone()
         if row is None:
             return False
-        request_id, correlation_id, body = row
-        reply = _run(handle, body)
-        with conn, conn.cursor() as cur:  # reply + removal of the request: all or nothing
+        msg_id, read_ct, body, stale = row
+        if stale or read_ct > MAX_READS:
+            log.warning("dropping request %s (%s)", msg_id,
+                        "abandoned by History" if stale else f"handed out {read_ct} times")
+            reply = None
+        else:
+            reply = _run(handle, body)
+        with conn, conn.cursor() as cur:  
             if reply is not None:
-                cur.execute(REPLY, (correlation_id, json.dumps(reply), REPLY_TTL))
-            cur.execute(DONE, (request_id,))
+                try:
+                    correlation_id = str(json.loads(body)["id"])
+                except (ValueError, KeyError, TypeError):
+                    correlation_id = None
+                if correlation_id is not None:
+                    cur.execute(REPLY, (json.dumps({"id": correlation_id, "reply": reply}),))
+            cur.execute(DONE, (msg_id,))
         return True
 
 
@@ -220,3 +210,4 @@ def make_consumer(env=None):
             dbname=_need(env, "DB_NAME"), user=_need(env, "DB_USER"), password=_need(env, "DB_PASSWORD"),
         )
     raise ConfigError(f"QUEUE_BACKEND must be one of {', '.join(BACKENDS)}, got {backend!r}")
+

@@ -1,5 +1,8 @@
 FROM postgres:16-alpine
 
+COPY pgmq/pgmq.control pgmq/pgmq--1.13.0.sql /usr/local/share/postgresql/extension/
+RUN chmod 644 /usr/local/share/postgresql/extension/pgmq.control /usr/local/share/postgresql/extension/pgmq--1.13.0.sql
+
 COPY entrypoint.sh /usr/local/bin/citybikes-entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/citybikes-entrypoint.sh && chmod 755 /usr/local/bin/citybikes-entrypoint.sh
 

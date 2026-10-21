@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 import uuid
 
@@ -8,8 +9,8 @@ from db import DatabaseUnavailable
 log = logging.getLogger("history.broker")
 
 REQUEST_QUEUE = "fetch.requests"
-REPLY_TO = "amq.rabbitmq.reply-to"
-POLL = 0.3  
+REPLY_TO = "amq.rabbitmq.reply-to"   # RabbitMQ "direct reply-to": no reply queue to create or clean up
+POLL_MS = 200                        # how often pgmq.read_with_poll() looks for the reply, in milliseconds
 
 
 class BrokerError(Exception):
@@ -21,7 +22,6 @@ class QueueTimeout(BrokerError):
 
 
 # ============================================================== RabbitMQ
-
 class RabbitRequester:
     name = "rabbitmq"
 
@@ -44,11 +44,9 @@ class RabbitRequester:
         got = {}
 
         def on_reply(_channel, _method, props, body):
-            if props.correlation_id == correlation_id:  # only the answer to OUR request
+            if props.correlation_id == correlation_id:
                 got["body"] = body
 
-        # a short-lived connection per request (one poll a minute): a restarted broker
-        # heals by itself, there is no stale connection to repair
         try:
             conn = pika.BlockingConnection(self._params())
         except errors as exc:
@@ -84,30 +82,26 @@ class RabbitRequester:
             raise BrokerError("reply is not valid JSON") from exc
 
 
-# ============================================================= PostgreSQL
-SCHEMA = """
-SELECT pg_advisory_xact_lock(727401);  -- History and Fetcher may both create the tables at start
-CREATE TABLE IF NOT EXISTS mq_requests (
-    id             BIGSERIAL   PRIMARY KEY,
-    queue          TEXT        NOT NULL,
-    correlation_id TEXT        NOT NULL,
-    body           TEXT        NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL,
-    locked_until   TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_mq_requests_queue ON mq_requests (queue, id);
-CREATE TABLE IF NOT EXISTS mq_replies (
-    correlation_id TEXT        PRIMARY KEY,
-    body           TEXT        NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL
-);
+# ============================================================= PostgreSQL ====
+
+REQUESTS = "fetch_requests"
+REPLIES = "fetch_replies"
+STALE_AFTER = 60       
+REPLY_VT = 30         
+
+SCHEMA = f"""
+SELECT pg_advisory_xact_lock(727401);  -- History and Fetcher may both set up at start
+CREATE EXTENSION IF NOT EXISTS pgmq;
+SELECT pgmq.create('{REQUESTS}');
+SELECT pgmq.create('{REPLIES}')
 """
-CLEANUP = ("DELETE FROM mq_requests WHERE expires_at < now() - interval '1 minute'; "
-           "DELETE FROM mq_replies WHERE expires_at < now()")
-SEND = ("INSERT INTO mq_requests (queue, correlation_id, body, expires_at) "
-        "VALUES (%s, %s, %s, now() + make_interval(secs => %s))")
-TAKE_REPLY = "DELETE FROM mq_replies WHERE correlation_id = %s RETURNING body"
-WITHDRAW = "DELETE FROM mq_requests WHERE correlation_id = %s"
+
+CLEANUP = (f"DELETE FROM pgmq.q_{REQUESTS} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'; "
+           f"DELETE FROM pgmq.q_{REPLIES} WHERE enqueued_at < now() - interval '{STALE_AFTER} seconds'")
+SEND = f"SELECT pgmq.send('{REQUESTS}', %s::jsonb)"
+WAIT_REPLY = (f"SELECT msg_id, message::text FROM pgmq.read_with_poll('{REPLIES}', {REPLY_VT}, 1, %s, {POLL_MS}, %s::jsonb)")
+DELETE_REPLY = f"SELECT pgmq.delete('{REPLIES}', %s::bigint)"
+WITHDRAW = f"SELECT pgmq.delete('{REQUESTS}', %s::bigint)"
 
 
 class PostgresRequester:
@@ -125,29 +119,32 @@ class PostgresRequester:
 
     def request(self, timeout):
         correlation_id = uuid.uuid4().hex
+        mine = json.dumps({"id": correlation_id})
         try:
             with self._db.connection() as conn:
-                conn.autocommit = True  # every statement is visible to the Fetcher at once
+                conn.autocommit = True  
                 self._ensure_schema(conn)
                 with conn.cursor() as cur:
                     cur.execute(CLEANUP)
-                    cur.execute(SEND, (REQUEST_QUEUE, correlation_id, json.dumps({"id": correlation_id}), timeout))
-                    deadline = time.monotonic() + timeout
-                    while True:
-                        cur.execute(TAKE_REPLY, (correlation_id,))
-                        row = cur.fetchone()
-                        if row is not None:
-                            break
-                        if time.monotonic() >= deadline:
-                            cur.execute(WITHDRAW, (correlation_id,))  # nobody took it: withdraw it
-                            raise QueueTimeout("no answer in time")
-                        time.sleep(POLL)
+                    cur.execute(SEND, (mine,))
+                    request_msg_id = cur.fetchone()[0]
+
+                    cur.execute(WAIT_REPLY, (max(1, math.ceil(timeout)), mine))
+                    row = cur.fetchone()
+                    if row is None:
+                        cur.execute(WITHDRAW, (request_msg_id,))  
+                        raise QueueTimeout("no answer in time")
+                    reply_msg_id, body = row
+                    cur.execute(DELETE_REPLY, (reply_msg_id,))
         except DatabaseUnavailable as exc:
             raise BrokerError(str(exc)) from exc
         try:
-            return json.loads(row[0])
-        except ValueError as exc:
-            raise BrokerError("reply is not valid JSON") from exc
+            reply = json.loads(body)["reply"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise BrokerError("reply is not valid JSON with a 'reply' field") from exc
+        if not isinstance(reply, dict):
+            raise BrokerError("reply is not an object")
+        return reply
 
 
 # ================================================================ factory
